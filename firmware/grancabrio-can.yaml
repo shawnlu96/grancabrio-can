@@ -1,0 +1,267 @@
+# ─────────────────────────────────────────────────────────────────────
+# grancabrio-can — passive CAN reader for the 2016 Maserati GranCabrio (ESPHome, ESP32-S3)
+#
+# Listens to the broadcast frames on OBD-II pins 6/14 and decodes the signals documented in
+# ../dbc/maserati_grancabrio_2016.dbc. Shows them on a built-in web page (and in Home
+# Assistant through the native API). Optionally streams every raw frame to the "UART" USB
+# port in candump format for recording (see canlog.h, tools/serial_capture.py).
+#
+# The CAN controller runs in LISTENONLY mode: it never transmits, not even ACK bits.
+# Wiring and power: ../docs/hardware.md. Read it first — power from a switched USB port,
+# never from OBD pin 16.
+#
+#   cp secrets.yaml.example secrets.yaml   # fill it in
+#   esphome run grancabrio-can.yaml
+# ─────────────────────────────────────────────────────────────────────
+substitutions:
+  name: grancabrio-can
+  can_tx_pin: GPIO4
+  can_rx_pin: GPIO5
+
+esphome:
+  name: ${name}
+  friendly_name: GranCabrio CAN
+  includes:
+    - candec.h
+    - vehicle.h
+    - drive.h
+    - canlog.h
+  on_boot:
+    - priority: 800
+      then:
+        - lambda: |-
+            canlog::init();
+            // Performance (P) and gear-change (G) results go to the log and to "Last Drive Event".
+            // Wheel-speed (W) lines are not logged: the wheel sensors below already show them.
+            drive::set_sink([](const char *l, size_t n) {
+              if (n == 0 || l[0] == 'W') return;
+              size_t m = (l[n - 1] == '\n') ? n - 1 : n;
+              ESP_LOGI("drive", "%.*s", (int) m, l);
+              id(last_event) = std::string(l, m);
+            });
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  # Fallback hotspot when the configured network is not around (e.g. in the car).
+  ap:
+    ssid: "${name}"
+    password: !secret ap_password
+
+captive_portal:
+
+# Logs go over the network API / web page. UART0 is reserved for the raw frame stream.
+logger:
+  level: INFO
+  baud_rate: 0
+
+api:
+  encryption:
+    key: !secret api_key
+  # Default is 15 min: with no Home Assistant connected, the board would reboot itself every
+  # 15 minutes ("No clients; rebooting"). In a car nobody is connected most of the time.
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+web_server:
+  port: 80
+  version: 3
+  # By default the page loads its JavaScript from an internet CDN; in a car there is usually
+  # no internet, so the page would be blank exactly when you need it. Embed it instead.
+  local: true
+
+globals:
+  - id: last_event
+    type: std::string
+    restore_value: no
+
+canbus:
+  - platform: esp32_can
+    id: car_can
+    tx_pin: ${can_tx_pin}
+    rx_pin: ${can_rx_pin}
+    can_id: 0x7FF          # required by ESPHome; never used, LISTENONLY does not transmit
+    bit_rate: 500kbps
+    mode: LISTENONLY
+    # The ESP-IDF default RX queue is 5 frames. ESPHome drains it about every 16 ms while the
+    # bus carries ~1300 frames/s (~20 per 16 ms), so with the default ~70 % of all frames are
+    # silently dropped (watch "CAN RX Missed"). 256 frames = ~200 ms of headroom, ~5 KB RAM.
+    rx_queue_len: 256
+    on_frame:
+      - can_id: 0x000
+        can_id_mask: 0x000    # every frame
+        then:
+          - lambda: |-
+              uint32_t now = millis();
+              vehicle::on_frame(can_id, x.data(), x.size(), now);
+              drive::on_frame(can_id, x.data(), x.size(), now);
+              canlog::frame(now, can_id, x);
+
+interval:
+  - interval: 200ms
+    then:
+      - lambda: 'drive::tick(millis());'
+
+switch:
+  - platform: template
+    name: "CAN Log To Serial"   # raw frames -> UART port, candump format, 921600 baud
+    id: sw_canlog
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: 'canlog::set_on(true);'
+    turn_off_action:
+      - lambda: 'canlog::set_on(false);'
+
+binary_sensor:
+  - platform: template
+    name: "Brake"
+    lambda: |-
+      float b = vehicle::brake(millis());
+      if (std::isnan(b)) return {};
+      return b > 0.5f;
+
+text_sensor:
+  - platform: template
+    name: "Last Drive Event"      # latest P (performance) or G (gear change) line, see drive.h
+    lambda: 'return id(last_event);'
+    update_interval: 2s
+
+sensor:
+  # ── decoded signals (NaN = not received in the last second) ─────────
+  - platform: template
+    name: "Steering Wheel Angle"  # positive = left
+    unit_of_measurement: "°"
+    lambda: 'return vehicle::steering_deg(millis());'
+    update_interval: 500ms
+    accuracy_decimals: 1
+  - platform: template
+    name: "Vehicle Speed"
+    unit_of_measurement: "km/h"
+    lambda: 'return vehicle::speed_kmh(millis());'
+    update_interval: 1s
+    accuracy_decimals: 1
+  - platform: template
+    name: "Engine Speed"
+    unit_of_measurement: "rpm"
+    lambda: 'return vehicle::rpm(millis());'
+    update_interval: 1s
+    accuracy_decimals: 0
+  - platform: template
+    name: "Engine Load"
+    unit_of_measurement: "%"
+    lambda: 'return vehicle::load_pct(millis());'
+    update_interval: 1s
+    accuracy_decimals: 0
+  - platform: template
+    name: "Gear"                  # 1-6 engaged, 7 neutral/none, 0 engine not running
+    lambda: 'return vehicle::gear(millis());'
+    update_interval: 1s
+    accuracy_decimals: 0
+  - platform: template
+    name: "Coolant Temperature"
+    unit_of_measurement: "°C"
+    lambda: 'return vehicle::coolant_c(millis());'
+    update_interval: 5s
+    accuracy_decimals: 0
+  - platform: template
+    name: "Engine Oil Temperature"
+    unit_of_measurement: "°C"
+    lambda: 'return vehicle::oil_c(millis());'
+    update_interval: 5s
+    accuracy_decimals: 0
+  - platform: template
+    name: "Trip Distance"         # since power-up, from the 10 m counter in 0x560
+    unit_of_measurement: "m"
+    lambda: 'return vehicle::trip_m(millis());'
+    update_interval: 5s
+    accuracy_decimals: 0
+  - platform: template
+    name: "Wheel Speed FL"
+    unit_of_measurement: "km/h"
+    lambda: 'return vehicle::wheel_kmh(candec::FL, millis());'
+    update_interval: 1s
+    accuracy_decimals: 2
+  - platform: template
+    name: "Wheel Speed FR"
+    unit_of_measurement: "km/h"
+    lambda: 'return vehicle::wheel_kmh(candec::FR, millis());'
+    update_interval: 1s
+    accuracy_decimals: 2
+  - platform: template
+    name: "Wheel Speed RL"
+    unit_of_measurement: "km/h"
+    lambda: 'return vehicle::wheel_kmh(candec::RL, millis());'
+    update_interval: 1s
+    accuracy_decimals: 2
+  - platform: template
+    name: "Wheel Speed RR"
+    unit_of_measurement: "km/h"
+    lambda: 'return vehicle::wheel_kmh(candec::RR, millis());'
+    update_interval: 1s
+    accuracy_decimals: 2
+
+  # ── bus health: the first thing to look at when nothing decodes ─────
+  # ESPHome's esp32_can reports nothing at runtime, so ask the TWAI driver directly.
+  #   frames stay 0          -> electrical problem (wiring, transceiver, TX/RX swapped, bit rate)
+  #   bus errors climbing    -> connected but the signal is wrong (swap TX/RX, check CANH/CANL)
+  #   RX missed climbing     -> frames arrive faster than they are read (rx_queue_len)
+  - platform: template
+    name: "CAN Frames"
+    lambda: 'return (float) vehicle::frames();'
+    update_interval: 5s
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    name: "CAN Bus Errors"
+    lambda: |-
+      twai_status_info_t st;
+      if (twai_get_status_info(&st) != ESP_OK) return NAN;
+      return (float) st.bus_error_count;
+    update_interval: 5s
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    name: "CAN RX Missed"
+    lambda: |-
+      twai_status_info_t st;
+      if (twai_get_status_info(&st) != ESP_OK) return NAN;
+      return (float) st.rx_missed_count;
+    update_interval: 5s
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    name: "CAN State"             # 0 stopped, 1 running, 2 bus-off, 3 recovering
+    lambda: |-
+      twai_status_info_t st;
+      if (twai_get_status_info(&st) != ESP_OK) return NAN;
+      return (float) st.state;
+    update_interval: 5s
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    name: "Serial Log Sent"
+    lambda: 'return (float) canlog::sent();'
+    update_interval: 5s
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    name: "Serial Log Dropped"
+    lambda: 'return (float) canlog::dropped();'
+    update_interval: 5s
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: uptime
+    name: "Uptime"
+  - platform: wifi_signal
+    name: "WiFi RSSI"
+    update_interval: 30s

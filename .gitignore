@@ -1,0 +1,5 @@
+firmware/secrets.yaml
+firmware/.esphome/
+__pycache__/
+*.pyc
+.DS_Store
